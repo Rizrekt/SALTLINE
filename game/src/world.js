@@ -1,355 +1,412 @@
-// THE SALTLINE — the rules and the state, with no drawing and no browser
-// in it: a grid coast, a tide that redraws it after every wave, raiders
-// who path over land (and wade, slowly, when the land runs out), towers
-// and barricades bought with driftwood, and the beacon's flame.
-// step() advances one fixed step and returns what happened as bit flags.
-// All randomness comes from the injected seeded generator, in a fixed
-// order, so the same seed always plays the same game.
-import { BEACON, BUILD, FIELD, START_WOOD, TIDE_BY_WAVE, WAVES_TO_WIN, WOOD_PER_WAVE } from './config.js';
+// THE SALTLINE — the simulation: shore, tide, raiders, towers, beacon.
+//
+// The one mechanic everything hangs on: after every wave the tide
+// redraws the map. The shoreline column moves, cells flood or dry out,
+// towers standing in new water are washed away, fresh land leaves
+// driftwood behind, and the raiders' path to the beacon is re-walked
+// over the new shore. The next shoreline is always computed one wave
+// ahead and drawn as a preview line, so the player plans against it.
 
-export const EVENT_SHOOT = 1;
-export const EVENT_CANNON = 2;
-export const EVENT_LEAK = 4; // a raider reached the beacon
-export const EVENT_TIDE = 8; // the water level changed
-export const EVENT_WAVE_CLEAR = 16;
-export const EVENT_WIN = 32;
-export const EVENT_LOSE = 64;
-export const EVENT_BUILD = 128;
+import {
+  BEACON_COL, BEACON_ROW, BEACON_MAX_HP, BARRICADE_MAX_HP, CELL, COLS,
+  COSTS, LANES, LANTERN_COOLDOWN, LANTERN_DAMAGE, LANTERN_RANGE,
+  PROJECTILE_SPEED, ROWS, SALVAGE, SHORE_MAX, SHORE_MIN, SHORE_START,
+  START_DRIFTWOOD, TIDE_SWING, TOTAL_WAVES, WAVE_CLEAR_BONUS,
+  enemyStats, waveSize,
+} from './config.js';
+import { makeRng, rngInt } from './random.js';
 
-export const PHASE_BUILD = 'build';
-export const PHASE_WAVE = 'wave';
-export const PHASE_WON = 'won';
-export const PHASE_LOST = 'lost';
+let nextId = 1;
 
-const ENEMY_TYPES = {
-  raider: { hp: 6, speed: 0.95, damage: 1, score: 10 },
-  runner: { hp: 4, speed: 1.65, damage: 1, score: 15 },
-  brute: { hp: 26, speed: 0.55, damage: 3, score: 30 },
-};
+export class World {
+  constructor(seed) {
+    this.seed = seed;
+    this.rng = makeRng(seed);
+    this.time = 0;
+    this.wave = 0; // waves started so far
+    this.phase = 'build'; // build | wave | won | lost
+    this.beaconHp = BEACON_MAX_HP;
+    this.driftwood = START_DRIFTWOOD;
+    this.score = 0;
+    this.kills = 0;
+    this.towers = [];
+    this.enemies = [];
+    this.projectiles = [];
+    this.effects = []; // floating texts: {x, y, text, t, life, color}
+    this.events = []; // sound event names, drained by main.js each frame
+    this.banner = null; // {text, sub, t, life}
+    this.version = 0; // bumped whenever paths must be re-walked
 
-const TOWER_TYPES = {
-  lantern: { range: 2.6, rate: 2.0, damage: 1 },
-  cannon: { range: 3.3, rate: 0.55, damage: 6 },
-};
+    // The shore is not a straight line: each row keeps its own offset.
+    this.rowOffset = [];
+    for (let r = 0; r < ROWS; r++) this.rowOffset.push(rngInt(this.rng, -1, 1));
+    this.shoreBase = SHORE_START;
+    this.nextShoreBase = this.rollShore(this.shoreBase);
+    this.tideFlash = 0; // seconds of foam animation left after a redraw
 
-const BARRICADE_HP = 30;
-/** Path cost of a barricaded cell: avoided unless there is no other way. */
-const BARRICADE_COST = 40;
-/** Driftwood chance on a cell the falling tide has just exposed. */
-const DRIFTWOOD_CHANCE = 0.6;
-
-const idx = (c, r) => r * FIELD.cols + c;
-const inGrid = (c, r) => c >= 0 && r >= 0 && c < FIELD.cols && r < FIELD.rows;
-
-export function createWorld(random) {
-  // --- terrain: a designed coast, jittered by the seed -----------------
-  // Elevation rises from the western sea to the eastern beacon hill, with
-  // a lagoon carved mid-map that only floods at high tide.
-  const elevation = new Array(FIELD.cols * FIELD.rows).fill(0);
-  const beacon = { c: FIELD.cols - 2, r: Math.floor(FIELD.rows / 2) };
-  for (let r = 0; r < FIELD.rows; r += 1) {
-    for (let c = 0; c < FIELD.cols; c += 1) {
-      let e = c < 3 ? 0 : c < 6 ? 1 : c < 10 ? 2 : c < 13 ? 2 : 3;
-      if (c >= 6 && c <= 9 && r >= 4 && r <= 6) e = 0; // the lagoon
-      if (c >= 3 && c <= 12 && random() < 0.22) e = Math.max(0, e - 1);
-      elevation[idx(c, r)] = e;
-    }
-  }
-  elevation[idx(beacon.c, beacon.r)] = 3;
-
-  const state = {
-    elevation,
-    beacon,
-    waterLevel: TIDE_BY_WAVE[0],
-    wave: 0, // waves completed
-    phase: PHASE_BUILD,
-    wood: START_WOOD,
-    score: 0,
-    beaconHealth: BEACON.health,
-    towers: [], // {c, r, kind, cooldown}
-    barricades: [], // {c, r, hp}
-    enemies: [], // {x, y, hp, maxHp, kind, path, next, attackCd}
-    tracers: [], // {x1, y1, x2, y2, ttl, kind}
-    driftwood: new Set(), // cell indexes holding driftwood right now
-    spawnQueue: [],
-    spawnTimer: 0,
-    elapsed: 0,
-    kills: 0,
-  };
-
-  const isWater = (c, r) => elevation[idx(c, r)] <= state.waterLevel;
-  const barricadeAt = (c, r) => state.barricades.find((b) => b.c === c && b.r === r) ?? null;
-  const towerAt = (c, r) => state.towers.find((t) => t.c === c && t.r === r) ?? null;
-
-  /** The water level the NEXT wave will play at (shown to the player). */
-  function nextWaterLevel() {
-    const nextWave = Math.min(state.wave + 1, WAVES_TO_WIN);
-    return TIDE_BY_WAVE[nextWave - 1] ?? state.waterLevel;
+    this.spawnQueue = [];
+    this.spawnTimer = 0;
   }
 
-  /** Dijkstra over the grid: land 1, shallow 2.5, deep 5, barricade 40. */
-  function findPath(fromC, fromR) {
-    const total = FIELD.cols * FIELD.rows;
-    const dist = new Array(total).fill(Infinity);
-    const prev = new Array(total).fill(-1);
-    const done = new Array(total).fill(false);
-    const start = idx(fromC, fromR);
-    const goal = idx(beacon.c, beacon.r);
-    dist[start] = 0;
-    for (let n = 0; n < total; n += 1) {
-      let u = -1;
-      let best = Infinity;
-      for (let i = 0; i < total; i += 1) {
-        if (!done[i] && dist[i] < best) { best = dist[i]; u = i; }
-      }
-      if (u === -1 || u === goal) break;
-      done[u] = true;
-      const uc = u % FIELD.cols;
-      const ur = Math.floor(u / FIELD.cols);
-      for (const [dc, dr] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-        const vc = uc + dc;
-        const vr = ur + dr;
-        if (!inGrid(vc, vr)) continue;
-        const v = idx(vc, vr);
-        let cost = 1;
-        if (barricadeAt(vc, vr) !== null) cost = BARRICADE_COST;
-        else if (isWater(vc, vr)) cost = elevation[v] === state.waterLevel ? 2.5 : 5;
-        if (dist[u] + cost < dist[v]) {
-          dist[v] = dist[u] + cost;
-          prev[v] = u;
+  // --- shore geometry -------------------------------------------------
+
+  shoreAt(row, base = this.shoreBase) {
+    const s = base + this.rowOffset[row];
+    return Math.max(6, Math.min(COLS, s));
+  }
+
+  isWater(col, row, base) {
+    return col >= this.shoreAt(row, base);
+  }
+
+  isBeaconCell(col, row) {
+    return col === BEACON_COL && row === BEACON_ROW;
+  }
+
+  rollShore(from) {
+    const delta = rngInt(this.rng, -TIDE_SWING, TIDE_SWING);
+    return Math.max(SHORE_MIN, Math.min(SHORE_MAX, from + delta));
+  }
+
+  towerAt(col, row) {
+    return this.towers.find((t) => t.col === col && t.row === row) || null;
+  }
+
+  // --- pathfinding ------------------------------------------------------
+  // Breadth-first walk over dry cells. Barricades block; lanterns do not.
+  // The beacon cell is the goal and is always enterable as the last step.
+
+  findPath(fromCol, fromRow) {
+    const key = (c, r) => r * COLS + c;
+    const prev = new Map();
+    const seen = new Set([key(fromCol, fromRow)]);
+    const queue = [[fromCol, fromRow]];
+    const goal = key(BEACON_COL, BEACON_ROW);
+    while (queue.length) {
+      const [c, r] = queue.shift();
+      if (key(c, r) === goal) {
+        const path = [];
+        let k = goal;
+        while (k !== undefined) {
+          path.push({ col: k % COLS, row: Math.floor(k / COLS) });
+          k = prev.get(k);
         }
+        return path.reverse();
+      }
+      for (const [dc, dr] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nc = c + dc;
+        const nr = r + dr;
+        if (nc < 0 || nr < 0 || nc >= COLS || nr >= ROWS) continue;
+        const nk = key(nc, nr);
+        if (seen.has(nk)) continue;
+        if (this.isWater(nc, nr)) continue;
+        const tower = this.towerAt(nc, nr);
+        if (tower && tower.kind === 'barricade' && nk !== goal) continue;
+        seen.add(nk);
+        prev.set(nk, key(c, r));
+        queue.push([nc, nr]);
       }
     }
-    const path = [];
-    let cur = goal;
-    while (cur !== -1) {
-      path.push({ c: cur % FIELD.cols, r: Math.floor(cur / FIELD.cols) });
-      if (cur === start) break;
-      cur = prev[cur];
+    return null;
+  }
+
+  // The dry cell where a lane's raiders step ashore.
+  landingCell(row) {
+    return { col: this.shoreAt(row) - 1, row };
+  }
+
+  anyPathExists(extraBlock) {
+    for (const row of LANES) {
+      const cell = this.landingCell(row);
+      if (extraBlock && extraBlock.col === cell.col && extraBlock.row === cell.row) continue;
+      if (this.findPath(cell.col, cell.row)) return true;
     }
-    path.reverse();
-    return path;
+    return false;
   }
 
-  /** The route from the busiest spawn shore to the beacon, for display. */
-  function shorePath() {
-    return findPath(0, beacon.r);
-  }
+  // --- building ---------------------------------------------------------
 
-  function canBuild(c, r, kind) {
-    if (!inGrid(c, r)) return false;
-    if (c === beacon.c && r === beacon.r) return false;
-    if (isWater(c, r)) return false;
-    if (towerAt(c, r) !== null || barricadeAt(c, r) !== null) return false;
-    if (kind !== 'barricade' && c === 0) return false; // towers need footing ashore
-    return state.wood >= BUILD[kind].cost;
-  }
-
-  function build(c, r, kind) {
-    if (!canBuild(c, r, kind)) return false;
-    state.wood -= BUILD[kind].cost;
-    if (kind === 'barricade') state.barricades.push({ c, r, hp: BARRICADE_HP });
-    else state.towers.push({ c, r, kind, cooldown: 0 });
-    for (const enemy of state.enemies) enemy.path = findPath(Math.round(enemy.x), Math.round(enemy.y));
+  canBuild(kind, col, row) {
+    if (col < 0 || row < 0 || col >= COLS || row >= ROWS) return false;
+    if (this.isWater(col, row)) return false;
+    if (this.isBeaconCell(col, row)) return false;
+    if (this.towerAt(col, row)) return false;
+    if (this.driftwood < COSTS[kind]) return false;
+    if (kind === 'barricade') {
+      // A barricade may narrow the shore but never seal it: at least one
+      // landing must keep a path to the beacon with this cell blocked.
+      const probe = { kind: 'barricade', col, row, hp: 1 };
+      this.towers.push(probe);
+      const ok = this.anyPathExists(null);
+      this.towers.pop();
+      if (!ok) return false;
+    }
     return true;
   }
 
-  function planWave() {
-    const wave = state.wave + 1;
-    const queue = [];
-    const count = 6 + wave * 3;
-    for (let i = 0; i < count; i += 1) {
-      let kind = 'raider';
-      const roll = random();
-      if (wave >= 5 && roll < 0.16) kind = 'brute';
-      else if (wave >= 3 && roll < 0.45) kind = 'runner';
-      queue.push(kind);
+  build(kind, col, row) {
+    if (!this.canBuild(kind, col, row)) return false;
+    this.driftwood -= COSTS[kind];
+    this.towers.push({
+      id: nextId++, kind, col, row,
+      hp: kind === 'barricade' ? BARRICADE_MAX_HP : 999,
+      cooldown: 0,
+    });
+    this.version++;
+    this.events.push('build');
+    this.addEffect(col * CELL + CELL / 2, row * CELL, kind === 'lantern' ? 'LANTERN LIT' : 'BARRICADE UP', '#ffd97a');
+    return true;
+  }
+
+  // --- waves ------------------------------------------------------------
+
+  startWave() {
+    if (this.phase !== 'build' || this.wave >= TOTAL_WAVES) return false;
+    this.wave++;
+    const total = waveSize(this.wave);
+    const kinds = [];
+    const brutes = this.wave >= 5 ? Math.min(4, this.wave - 4) : 0;
+    const runners = this.wave >= 3 ? Math.floor(total / 3) : 0;
+    for (let i = 0; i < total - brutes - runners; i++) kinds.push('raider');
+    for (let i = 0; i < runners; i++) kinds.push('runner');
+    for (let i = 0; i < brutes; i++) kinds.push('brute');
+    // Shuffle the march order so lanes and kinds interleave.
+    for (let i = kinds.length - 1; i > 0; i--) {
+      const j = Math.floor(this.rng() * (i + 1));
+      [kinds[i], kinds[j]] = [kinds[j], kinds[i]];
     }
-    state.spawnQueue = queue;
-    state.spawnTimer = 0;
+    this.spawnQueue = kinds;
+    this.spawnTimer = 0.4;
+    this.phase = 'wave';
+    this.events.push('waveStart');
+    this.setBanner(`WAVE ${this.wave} OF ${TOTAL_WAVES}`, 'the raiders are landing');
+    return true;
   }
 
-  function startWave() {
-    if (state.phase !== PHASE_BUILD) return 0;
-    let events = 0;
-    const target = nextWaterLevel();
-    if (target !== state.waterLevel) {
-      const falling = target < state.waterLevel;
-      state.waterLevel = target;
-      events |= EVENT_TIDE;
-      if (falling) {
-        // The tide gives back land — and leaves driftwood on it.
-        for (let i = 0; i < elevation.length; i += 1) {
-          if (elevation[i] === target + 1 && random() < DRIFTWOOD_CHANCE) state.driftwood.add(i);
-        }
-      }
-    }
-    planWave();
-    state.phase = PHASE_WAVE;
-    return events;
-  }
-
-  function collectDriftwood() {
-    const gained = state.driftwood.size;
-    state.driftwood.clear();
-    return gained;
-  }
-
-  function spawnEnemy() {
-    const kind = state.spawnQueue.shift();
-    const spec = ENEMY_TYPES[kind];
-    const hpScale = 1 + 0.15 * state.wave;
-    // Raiders land anywhere along the western shore.
-    const r = Math.floor(random() * FIELD.rows);
+  spawnEnemy(kind, row, pathFraction = 0) {
+    const stats = enemyStats(kind, Math.max(1, this.wave));
+    const cell = this.landingCell(row);
+    const path = this.findPath(cell.col, cell.row);
+    if (!path) return null;
+    const idx = Math.min(path.length - 1, Math.floor(pathFraction * path.length));
+    const at = path[Math.max(0, idx - 1)] || path[0];
+    // A touch of per-raider variance keeps the march from looking like a
+    // conveyor belt; it comes from the world stream, so seeds stay exact.
+    const pace = 0.9 + this.rng() * 0.2;
     const enemy = {
-      x: -0.6,
-      y: r,
-      hp: Math.round(spec.hp * hpScale),
-      maxHp: Math.round(spec.hp * hpScale),
-      kind,
-      path: findPath(0, r),
-      next: 1,
-      attackCd: 0,
+      id: nextId++, kind, row,
+      x: at.col * CELL + CELL / 2, y: at.row * CELL + CELL / 2,
+      hp: stats.hp, maxHp: stats.hp, speed: stats.speed * pace,
+      damage: stats.damage, bounty: stats.bounty, radius: stats.radius,
+      path, pathI: Math.max(1, idx), pathVersion: this.version,
+      wobble: this.rng() * Math.PI * 2,
     };
-    enemy.path = findPath(0, r);
-    state.enemies.push(enemy);
+    this.enemies.push(enemy);
+    return enemy;
   }
 
-  function enemyProgress(enemy) {
-    const remain = enemy.path.length - enemy.next;
-    const target = enemy.path[Math.min(enemy.next, enemy.path.length - 1)];
-    const dx = target.c - enemy.x;
-    const dy = target.r - enemy.y;
-    return -(remain * 10 + Math.hypot(dx, dy));
+  // --- the tide -----------------------------------------------------------
+
+  applyTide() {
+    const oldBase = this.shoreBase;
+    this.shoreBase = this.nextShoreBase;
+    this.nextShoreBase = this.rollShore(this.shoreBase);
+    this.tideFlash = 1.4;
+    this.version++;
+    this.events.push('tide');
+
+    // Towers the sea now covers are washed away, returning some wood.
+    let salvaged = 0;
+    this.towers = this.towers.filter((t) => {
+      if (this.isWater(t.col, t.row)) {
+        salvaged++;
+        this.addEffect(t.col * CELL + CELL / 2, t.row * CELL, 'WASHED AWAY', '#cfe8dd');
+        return false;
+      }
+      return true;
+    });
+    if (salvaged) this.driftwood += salvaged * SALVAGE;
+
+    // Raiders caught standing where the sea now reaches are swept off
+    // the shore with it — no bounty, but no threat either. The tide is
+    // a weapon for whoever reads the dashed line better.
+    this.enemies = this.enemies.filter((e) => {
+      const col = Math.floor(e.x / CELL);
+      const row = Math.floor(e.y / CELL);
+      if (this.isWater(col, row)) {
+        this.addEffect(e.x, e.y, 'SWEPT AWAY', '#a0e1ff');
+        return false;
+      }
+      return true;
+    });
+
+    // Land the tide uncovers is littered with driftwood: free timber.
+    const exposed = Math.max(0, this.shoreBase - oldBase) * ROWS;
+    const found = exposed > 0 ? Math.round(exposed * 0.9) + rngInt(this.rng, 0, 6) : rngInt(this.rng, 2, 7);
+    this.driftwood += found;
+
+    const dir = this.shoreBase > oldBase ? 'falls' : this.shoreBase < oldBase ? 'rises' : 'holds';
+    this.setBanner(
+      'THE TIDE REDRAWS THE SHORE',
+      `the tide ${dir} — driftwood +${found}${salvaged ? `, ${salvaged} tower(s) lost` : ''}`,
+    );
   }
 
-  function stepWave(dt) {
-    let events = 0;
-    if (state.spawnQueue.length > 0) {
-      state.spawnTimer -= dt;
-      if (state.spawnTimer <= 0) {
-        spawnEnemy();
-        state.spawnTimer = 1.1;
+  setBanner(text, sub) {
+    this.banner = { text, sub, t: 0, life: 2.6 };
+  }
+
+  addEffect(x, y, text, color) {
+    this.effects.push({ x, y, text, color, t: 0, life: 1.1 });
+  }
+
+  // --- per-frame update ---------------------------------------------------
+
+  update(dt) {
+    this.time += dt;
+    if (this.tideFlash > 0) this.tideFlash -= dt;
+    if (this.banner) {
+      this.banner.t += dt;
+      if (this.banner.t > this.banner.life) this.banner = null;
+    }
+    for (const fx of this.effects) fx.t += dt;
+    this.effects = this.effects.filter((fx) => fx.t < fx.life);
+    if (this.phase === 'won' || this.phase === 'lost') return;
+
+    // Spawning.
+    if (this.phase === 'wave' && this.spawnQueue.length) {
+      this.spawnTimer -= dt;
+      if (this.spawnTimer <= 0) {
+        const kind = this.spawnQueue.shift();
+        const row = LANES[Math.floor(this.rng() * LANES.length)];
+        this.spawnEnemy(kind, row, 0);
+        this.spawnTimer = 1.05;
       }
     }
-    // Towers fire at the most advanced enemy in range.
-    for (const tower of state.towers) {
-      tower.cooldown -= dt;
-      if (tower.cooldown > 0) continue;
-      const spec = TOWER_TYPES[tower.kind];
-      let bestEnemy = null;
-      let bestProgress = -Infinity;
-      for (const enemy of state.enemies) {
-        const d = Math.hypot(enemy.x - tower.c, enemy.y - tower.r);
-        if (d <= spec.range && enemyProgress(enemy) > bestProgress) {
-          bestProgress = enemyProgress(enemy);
-          bestEnemy = enemy;
-        }
-      }
-      if (bestEnemy !== null) {
-        tower.cooldown = 1 / spec.rate;
-        bestEnemy.hp -= spec.damage;
-        state.tracers.push({
-          x1: tower.c, y1: tower.r, x2: bestEnemy.x, y2: bestEnemy.y,
-          ttl: 0.09, kind: tower.kind,
-        });
-        events |= tower.kind === 'cannon' ? EVENT_CANNON : EVENT_SHOOT;
-      }
-    }
-    // Enemies advance, wade, batter barricades, or strike the beacon.
-    for (const enemy of state.enemies) {
-      if (enemy.hp <= 0) continue;
-      const spec = ENEMY_TYPES[enemy.kind];
-      if (enemy.next >= enemy.path.length) {
-        state.beaconHealth -= spec.damage;
-        enemy.hp = 0;
-        enemy.leaked = true;
-        events |= EVENT_LEAK;
-        continue;
-      }
-      const target = enemy.path[enemy.next];
-      const blocker = barricadeAt(target.c, target.r);
-      const dx = target.c - enemy.x;
-      const dy = target.r - enemy.y;
-      const dist = Math.hypot(dx, dy);
-      if (blocker !== null && dist < 0.55) {
-        enemy.attackCd -= dt;
-        if (enemy.attackCd <= 0) {
-          enemy.attackCd = 0.8;
-          blocker.hp -= 4;
-          if (blocker.hp <= 0) {
-            state.barricades = state.barricades.filter((b) => b !== blocker);
-            for (const other of state.enemies) other.path = findPath(Math.round(other.x), Math.round(other.y));
-          }
-        }
-        continue;
-      }
-      const wading = isWater(Math.round(enemy.x), Math.round(enemy.y));
-      const speed = spec.speed * (wading ? 0.45 : 1);
-      const move = Math.min(dist, speed * dt);
-      if (dist > 0.001) {
-        enemy.x += (dx / dist) * move;
-        enemy.y += (dy / dist) * move;
-      }
-      if (dist - move < 0.05) enemy.next += 1;
-    }
-    // Reap the dead.
-    for (const enemy of state.enemies) {
-      if (enemy.hp <= 0 && !enemy.leaked) {
-        state.score += ENEMY_TYPES[enemy.kind].score;
-        state.kills += 1;
-      }
-    }
-    state.enemies = state.enemies.filter((e) => e.hp > 0);
-    if (state.beaconHealth <= 0) {
-      state.beaconHealth = 0;
-      state.phase = PHASE_LOST;
-      events |= EVENT_LOSE;
-      return events;
-    }
-    if (state.spawnQueue.length === 0 && state.enemies.length === 0) {
-      state.wave += 1;
-      state.wood += WOOD_PER_WAVE + collectDriftwood();
-      if (state.wave >= WAVES_TO_WIN) {
-        state.phase = PHASE_WON;
-        events |= EVENT_WIN;
+
+    this.updateEnemies(dt);
+    this.updateTowers(dt);
+    this.updateProjectiles(dt);
+
+    // Wave cleared?
+    if (this.phase === 'wave' && !this.spawnQueue.length && !this.enemies.length) {
+      this.score += WAVE_CLEAR_BONUS;
+      if (this.wave >= TOTAL_WAVES) {
+        this.phase = 'won';
+        this.events.push('win');
+        this.setBanner('THE BEACON BURNS ON', 'you held the Saltline through ten waves');
       } else {
-        state.phase = PHASE_BUILD;
-        events |= EVENT_WAVE_CLEAR;
+        this.phase = 'build';
+        this.applyTide();
       }
     }
-    return events;
   }
 
-  /** One fixed step. In build phase the world idles (render ambience). */
-  function step(dt) {
-    state.elapsed += dt;
-    for (const tracer of state.tracers) tracer.ttl -= dt;
-    state.tracers = state.tracers.filter((t) => t.ttl > 0);
-    if (state.phase === PHASE_WAVE) return stepWave(dt);
-    return 0;
+  updateEnemies(dt) {
+    const beaconX = BEACON_COL * CELL + CELL / 2;
+    const beaconY = BEACON_ROW * CELL + CELL / 2;
+    for (const e of this.enemies) {
+      if (e.pathVersion !== this.version) {
+        const cell = { col: Math.floor(e.x / CELL), row: Math.floor(e.y / CELL) };
+        const path = this.findPath(
+          Math.max(0, Math.min(COLS - 1, cell.col)),
+          Math.max(0, Math.min(ROWS - 1, cell.row)),
+        );
+        if (path) {
+          e.path = path;
+          e.pathI = 1;
+          e.pathVersion = this.version;
+        }
+      }
+      const target = e.path[Math.min(e.pathI, e.path.length - 1)];
+      if (!target) continue;
+      const tx = target.col * CELL + CELL / 2;
+      const ty = target.row * CELL + CELL / 2;
+      const dx = tx - e.x;
+      const dy = ty - e.y;
+      const dist = Math.hypot(dx, dy);
+      const step = e.speed * dt;
+      if (dist <= Math.max(2, step)) {
+        e.x = tx;
+        e.y = ty;
+        e.pathI++;
+      } else {
+        e.x += (dx / dist) * step;
+        e.y += (dy / dist) * step;
+      }
+      // Reached the beacon: strike the flame and vanish into the surf.
+      if (Math.hypot(beaconX - e.x, beaconY - e.y) < 14 && e.pathI >= e.path.length) {
+        e.hp = 0;
+        e.struck = true;
+        this.beaconHp -= e.damage;
+        this.events.push('beaconHit');
+        this.addEffect(beaconX, beaconY - 24, `BEACON -${e.damage}`, '#e2483d');
+        if (this.beaconHp <= 0) {
+          this.beaconHp = 0;
+          this.phase = 'lost';
+          this.events.push('lose');
+          this.setBanner('THE FLAME IS OUT', 'the shore is lost');
+        }
+      }
+    }
+    this.enemies = this.enemies.filter((e) => e.hp > 0);
   }
 
-  function reset() {
-    state.waterLevel = TIDE_BY_WAVE[0];
-    state.wave = 0;
-    state.phase = PHASE_BUILD;
-    state.wood = START_WOOD;
-    state.score = 0;
-    state.beaconHealth = BEACON.health;
-    state.towers = [];
-    state.barricades = [];
-    state.enemies = [];
-    state.tracers = [];
-    state.driftwood = new Set();
-    state.spawnQueue = [];
-    state.spawnTimer = 0;
-    state.elapsed = 0;
-    state.kills = 0;
+  updateTowers(dt) {
+    for (const t of this.towers) {
+      if (t.kind !== 'lantern') continue;
+      t.cooldown -= dt;
+      if (t.cooldown > 0) continue;
+      const cx = t.col * CELL + CELL / 2;
+      const cy = t.row * CELL + CELL / 2;
+      // Fire on the raider closest to the beacon (deepest along its path).
+      let best = null;
+      let bestProgress = -1;
+      for (const e of this.enemies) {
+        const d = Math.hypot(e.x - cx, e.y - cy);
+        if (d > LANTERN_RANGE) continue;
+        const progress = e.pathI * 1000 - d;
+        if (progress > bestProgress) {
+          bestProgress = progress;
+          best = e;
+        }
+      }
+      if (best) {
+        t.cooldown = LANTERN_COOLDOWN;
+        this.projectiles.push({
+          id: nextId++, x: cx, y: cy - 8, target: best,
+          damage: LANTERN_DAMAGE, speed: PROJECTILE_SPEED,
+        });
+        this.events.push('shoot');
+      }
+    }
   }
 
-  return {
-    state, reset, step, startWave, build, canBuild, isWater,
-    nextWaterLevel, shorePath, barricadeAt, towerAt,
-  };
+  updateProjectiles(dt) {
+    const alive = [];
+    for (const p of this.projectiles) {
+      const target = p.target;
+      if (!target || target.hp <= 0) continue;
+      const dx = target.x - p.x;
+      const dy = target.y - p.y;
+      const dist = Math.hypot(dx, dy);
+      const step = p.speed * dt;
+      if (dist <= Math.max(3, step)) {
+        target.hp -= p.damage;
+        this.events.push('hit');
+        if (target.hp <= 0 && !target.struck) {
+          this.kills++;
+          this.score += 10 + this.wave;
+          this.driftwood += target.bounty;
+          this.events.push('die');
+          this.addEffect(target.x, target.y - 14, `+${target.bounty} WOOD`, '#ffd97a');
+        }
+        continue;
+      }
+      p.x += (dx / dist) * step;
+      p.y += (dy / dist) * step;
+      alive.push(p);
+    }
+    this.projectiles = alive;
+  }
 }

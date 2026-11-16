@@ -1,183 +1,131 @@
-// THE SALTLINE — boot and the one loop: clicks and keys are read every
-// frame, the world advances in fixed steps, and the renderer paints
-// what is there. Screens: title, play (build and wave phases inside
-// it), paused, won and game over.
+// THE SALTLINE — bootstrap and interaction.
 //
-// ?seed=N fixes the coast and the raiders. ?shot=start|play|tide|end
-// (with &seed=N) stages that scene instead of running the loop, paints
-// it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, STEP } from './config.js';
-import { createRandom } from './random.js';
-import {
-  createWorld, EVENT_CANNON, EVENT_LEAK, EVENT_LOSE, EVENT_TIDE,
-  EVENT_WAVE_CLEAR, EVENT_WIN, PHASE_BUILD,
-} from './world.js';
-import { ACTION_CONFIRM, ACTION_MUTE, ACTION_PAUSE, createInput } from './input.js';
-import {
-  createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WON,
-} from './render.js';
-import { stageShot } from './shots.js';
-import { sound } from './sound.js';
+// Two ways in: a screenshot scene (?shot=start|play|tide|end&seed=n),
+// which stages a deterministic world through shots.js, draws one frame
+// and raises window.__shotReady for the capture tool; and the live game
+// (?seed=n), a title screen that clicks through to the build/wave loop.
+//
+// The loop itself is plain requestAnimationFrame: step the world, drain
+// its sound events into the synth, draw the frame render.js composes.
 
-const MAX_FRAME = 0.25;
-
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+import { BTN_BARRICADE, BTN_LANTERN, BTN_START, VIEW_H, VIEW_W } from './config.js';
+import { World } from './world.js';
+import { drawFrame } from './render.js';
+import { cellAt, hitRect, keyIntent, toLogical } from './input.js';
+import { SoundFX } from './sound.js';
+import { buildShotScene } from './shots.js';
 
 const canvas = document.getElementById('game');
-const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
-const renderer = createRenderer(canvas);
+const ctx = canvas.getContext('2d');
+canvas.width = VIEW_W;
+canvas.height = VIEW_H;
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
-  }
+const params = new URLSearchParams(window.location.search);
+const seedParam = Number.parseInt(params.get('seed') || '', 10);
+const baseSeed = Number.isInteger(seedParam) && seedParam > 0 ? seedParam : 7;
+
+const sound = new SoundFX();
+const ui = { selected: 'lantern', hover: null, mode: 'title', muted: false };
+
+// --- screenshot mode ------------------------------------------------------
+
+const shotName = params.get('shot');
+if (shotName) {
+  const scene = buildShotScene(shotName, baseSeed);
+  ui.mode = scene.mode;
+  drawFrame(ctx, scene.world, ui);
+  window.__shotReady = true;
+} else {
+  startLiveGame();
 }
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score lasts this visit only.
-  }
-}
+// --- live game --------------------------------------------------------------
 
-function runShot(name) {
-  const scene = stageShot(name, world);
-  const ui = { selected: 'lantern', muted: false };
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best, ui, world);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
-}
-
-function runGame() {
-  const input = createInput(canvas, renderer);
-  const ui = { selected: 'lantern', muted: false };
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
+function startLiveGame() {
+  let world = new World(baseSeed);
+  ui.mode = 'title';
   let last = performance.now();
+  let overSince = 0; // guards the restart click: see handlePoint
 
-  function announce(message) {
-    status.textContent = message;
-  }
-
-  function react(events) {
-    if (events & EVENT_CANNON) sound.cannon();
-    if (events & EVENT_LEAK) {
-      sound.leak();
-      announce(world.state.beaconHealth === 1 ? 'The flame gutters — 1 left.' : `A raider hit the beacon. Flame ${world.state.beaconHealth}.`);
-    }
-    if (events & EVENT_TIDE) {
-      sound.tideBell();
-      announce('The tide has turned. The coast is redrawn.');
-    }
-    if (events & EVENT_WAVE_CLEAR) announce(`Wave cleared. Wave ${world.state.wave + 1} approaches. Build, then start the wave.`);
-    if (events & EVENT_WIN) {
-      sound.win();
-      screen = SCREEN_WON;
-      finishScore();
-    }
-    if (events & EVENT_LOSE) {
-      sound.lose();
-      screen = SCREEN_OVER;
-      finishScore();
-    }
-  }
-
-  function finishScore() {
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
-    }
-    announce(screen === SCREEN_WON ? `The shore holds! Score ${world.state.score}.` : `The flame is out. Score ${world.state.score}. Best ${best}.`);
-  }
-
-  function startGame() {
-    world.reset();
+  function restart() {
+    world = new World(baseSeed);
+    ui.mode = 'title';
     ui.selected = 'lantern';
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce('Build your defenses, then start wave 1. The dashed line is the raiders’ route.');
   }
 
-  function startWave() {
-    react(world.startWave());
-  }
-
-  function handleInput() {
-    for (const click of input.takeClicks()) {
-      sound.unlock();
-      if (screen === SCREEN_TITLE || screen === SCREEN_OVER || screen === SCREEN_WON) {
-        startGame();
-        return;
-      }
-      if (screen !== SCREEN_PLAY) continue;
-      if (click.tool !== undefined) {
-        if (click.tool === 'start') {
-          if (world.state.phase === PHASE_BUILD) startWave();
-        } else ui.selected = click.tool;
-      } else if (click.cell !== undefined && world.state.phase === PHASE_BUILD) {
-        if (world.build(click.cell.c, click.cell.r, ui.selected)) sound.build();
-      }
+  function handlePoint(x, y) {
+    sound.unlock();
+    if (ui.mode === 'title') {
+      ui.mode = 'play';
+      return;
     }
-    const actions = input.takeActions();
-    if (actions & ACTION_MUTE) ui.muted = sound.toggleMuted();
-    if (actions & ACTION_CONFIRM) {
-      sound.unlock();
-      if (screen === SCREEN_TITLE || screen === SCREEN_OVER || screen === SCREEN_WON) startGame();
-      else if (screen === SCREEN_PAUSED) screen = SCREEN_PLAY;
-      else if (screen === SCREEN_PLAY && world.state.phase === PHASE_BUILD) startWave();
+    if (ui.mode === 'over') {
+      // The click that lands the killing blow must not also restart the
+      // run: the end screen takes clicks only after a short beat.
+      if (performance.now() - overSince > 800) restart();
+      return;
     }
-    if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & ACTION_PAUSE && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
+    // HUD buttons first: they live below the grid.
+    if (hitRect(x, y, BTN_LANTERN)) {
+      ui.selected = 'lantern';
+      return;
+    }
+    if (hitRect(x, y, BTN_BARRICADE)) {
+      ui.selected = 'barricade';
+      return;
+    }
+    if (hitRect(x, y, BTN_START)) {
+      if (world.phase === 'build') world.startWave();
+      return;
+    }
+    const cell = cellAt(x, y);
+    if (cell && world.phase === 'build') {
+      world.build(ui.selected, cell.col, cell.row);
     }
   }
 
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    handleInput();
-    if (screen === SCREEN_PLAY || screen === SCREEN_TITLE) {
-      while (accumulator >= STEP) {
-        react(world.step(STEP));
-        accumulator -= STEP;
-        if (screen !== SCREEN_PLAY && screen !== SCREEN_TITLE) {
-          accumulator = 0;
-          break;
-        }
-      }
-    } else {
-      accumulator = 0;
-    }
-    renderer.draw(world.state, screen, best, ui, world);
-  }
-
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
+  canvas.addEventListener('pointerdown', (ev) => {
+    const p = toLogical(canvas, ev.clientX, ev.clientY);
+    handlePoint(p.x, p.y);
   });
 
-  announce('The Saltline. Click or press Space to begin.');
+  canvas.addEventListener('pointermove', (ev) => {
+    const p = toLogical(canvas, ev.clientX, ev.clientY);
+    ui.hover = cellAt(p.x, p.y);
+  });
+
+  window.addEventListener('keydown', (ev) => {
+    const intent = keyIntent(ev.key);
+    if (!intent) return;
+    sound.unlock();
+    if (intent === 'mute') {
+      ui.muted = sound.toggleMute();
+      return;
+    }
+    if (ui.mode !== 'play') {
+      if (intent === 'restart' && ui.mode === 'over') restart();
+      return;
+    }
+    if (intent === 'select-lantern') ui.selected = 'lantern';
+    if (intent === 'select-barricade') ui.selected = 'barricade';
+    if (intent === 'start-wave' && world.phase === 'build') world.startWave();
+    if (intent === 'restart' && (world.phase === 'won' || world.phase === 'lost')) restart();
+  });
+
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    if (ui.mode === 'play') {
+      world.update(dt);
+      for (const name of world.events) sound.play(name);
+      world.events.length = 0;
+      if (world.phase === 'won' || world.phase === 'lost') {
+        if (ui.mode !== 'over') overSince = now;
+        ui.mode = 'over';
+      }
+    }
+    drawFrame(ctx, world, ui);
+    requestAnimationFrame(frame);
+  }
   requestAnimationFrame(frame);
 }
-
-if (shot) runShot(shot);
-else runGame();
